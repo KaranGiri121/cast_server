@@ -110,3 +110,23 @@ if __name__ == "__main__":
     PORT = int(os.environ.get("PORT", 8080))
     log.info(f"Starting relay server on 0.0.0.0:{PORT}")
     web.run_app(app, host="0.0.0.0", port=PORT)
+
+
+# ── Serve socket.io.min.js for Cast devices that block CDNs ───────────────────
+async def serve_socketio_js(request):
+    import aiohttp
+    cdn = "https://cdn.socket.io/4.7.5/socket.io.min.js"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(cdn) as resp:
+                js = await resp.read()
+        return web.Response(
+            body=js,
+            content_type="application/javascript",
+            headers={"Cache-Control": "public, max-age=86400",
+                     "Access-Control-Allow-Origin": "*"},
+        )
+    except Exception as e:
+        return web.Response(status=502, text=f"Could not fetch socket.io.js: {e}")
+
+app.router.add_get("/socket.io/socket.io.js", serve_socketio_js)
