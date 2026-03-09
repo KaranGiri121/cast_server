@@ -1,17 +1,16 @@
 """
-Socket.IO Frame Receiver Server
---------------------------------
-Receives JPEG frames from Android device over Socket.IO.
-Runs on any machine (VPS, local, Docker).
+Socket.IO Relay Server — Android → Browser
+-------------------------------------------
+Android devices JOIN the "streamer" room and emit frames.
+Browser viewers JOIN the "viewer" room and receive relayed frames.
 
-Install dependencies:
+Install:
     pip install python-socketio[asyncio] aiohttp
 
-Run:
-    python server.py
+Run locally:    python server.py
+Render.com:     Start command → python server.py
 """
 
-import asyncio
 import os
 import logging
 from datetime import datetime
@@ -21,83 +20,93 @@ from aiohttp import web
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Socket.IO server (async mode) ──────────────────────────────────────────────
 sio = socketio.AsyncServer(
     async_mode="aiohttp",
-    cors_allowed_origins="*",          # tighten this in production
-    max_http_buffer_size=10 * 1024 * 1024,  # 10 MB — enough for a full JPEG frame
+    cors_allowed_origins="*",
+    max_http_buffer_size=10 * 1024 * 1024,
     ping_timeout=60,
     ping_interval=25,
 )
 app = web.Application()
 sio.attach(app)
 
-# ── Track connected Android streamers ─────────────────────────────────────────
-streamers: dict[str, dict] = {}   # sid → metadata
+# ── Two separate registries ────────────────────────────────────────────────────
+streamers: dict = {}   # sid → { frames, connected_at }
+viewers:   dict = {}   # sid → { connected_at }
 
 
-# ── Connection events ──────────────────────────────────────────────────────────
+# ── Connect / Disconnect ───────────────────────────────────────────────────────
 @sio.event
 async def connect(sid, environ):
     ip = environ.get("REMOTE_ADDR", "unknown")
     log.info(f"[CONNECT] sid={sid}  ip={ip}")
-    streamers[sid] = {"ip": ip, "frames": 0, "connected_at": datetime.utcnow().isoformat()}
-    await sio.emit("ack", {"status": "connected", "sid": sid}, to=sid)
 
 
 @sio.event
 async def disconnect(sid):
-    info = streamers.pop(sid, {})
-    log.info(f"[DISCONNECT] sid={sid}  total_frames={info.get('frames', 0)}")
+    if sid in streamers:
+        info = streamers.pop(sid)
+        log.info(f"[STREAMER LEFT] sid={sid}  frames={info['frames']}")
+        await sio.emit("streamer_left", {"sid": sid}, room="viewers")
+    elif sid in viewers:
+        viewers.pop(sid)
+        log.info(f"[VIEWER LEFT] sid={sid}")
 
 
-# ── Frame receiver ─────────────────────────────────────────────────────────────
+# ── Role registration ──────────────────────────────────────────────────────────
+@sio.on("register_streamer")
+async def register_streamer(sid, data=None):
+    """Android calls this once after connecting."""
+    streamers[sid] = {"frames": 0, "connected_at": datetime.utcnow().isoformat()}
+    await sio.enter_room(sid, "streamers")
+    log.info(f"[STREAMER REGISTERED] sid={sid}")
+    await sio.emit("ack", {"status": "registered_as_streamer", "sid": sid}, to=sid)
+    await sio.emit("streamer_joined", {"sid": sid}, room="viewers")
+
+
+@sio.on("register_viewer")
+async def register_viewer(sid, data=None):
+    """Browser calls this once after connecting."""
+    viewers[sid] = {"connected_at": datetime.utcnow().isoformat()}
+    await sio.enter_room(sid, "viewers")
+    log.info(f"[VIEWER REGISTERED] sid={sid}")
+    await sio.emit("ack", {
+        "status": "registered_as_viewer",
+        "sid": sid,
+        "streamers": list(streamers.keys()),
+    }, to=sid)
+
+
+# ── Frame relay ────────────────────────────────────────────────────────────────
 @sio.on("frame")
 async def on_frame(sid, data: bytes):
-    """
-    Android sends raw JPEG bytes under the event name 'frame'.
-    `data` is bytes here because Socket.IO treats binary payloads automatically.
-    """
+    """Android emits raw JPEG bytes → relay to every viewer instantly."""
     if sid not in streamers:
         return
 
     streamers[sid]["frames"] += 1
-    frame_count = streamers[sid]["frames"]
 
-    # ── Do whatever you want with the JPEG bytes ──
-    # Option 1: just log receipt
-    log.debug(f"[FRAME] sid={sid}  frame={frame_count}  size={len(data)} bytes")
+    # Relay binary frame to every connected viewer
+    await sio.emit("frame", {"sid": sid, "data": data}, room="viewers")
 
-    # Option 2: save every N-th frame to disk  (uncomment to enable)
-    # if frame_count % 30 == 0:
-    #     path = f"frames/frame_{sid}_{frame_count}.jpg"
-    #     with open(path, "wb") as f:
-    #         f.write(data)
-    #     log.info(f"[SAVED] {path}")
-
-    # Option 3: confirm receipt back to Android  (uncomment to enable)
-    # await sio.emit("frame_ack", {"frame": frame_count}, to=sid)
+    if streamers[sid]["frames"] % 100 == 0:
+        log.info(f"[RELAY] sid={sid}  frames={streamers[sid]['frames']}")
 
 
-# ── Simple health-check HTTP endpoint ─────────────────────────────────────────
+# ── Health check ───────────────────────────────────────────────────────────────
 async def health(request):
     return web.json_response({
         "status": "ok",
         "streamers": len(streamers),
-        "clients": [
-            {"sid": sid, **meta} for sid, meta in streamers.items()
-        ],
+        "viewers": len(viewers),
+        "streamer_list": [{"sid": sid, **meta} for sid, meta in streamers.items()],
+        "viewer_list":   [{"sid": sid, **meta} for sid, meta in viewers.items()],
     })
 
 app.router.add_get("/health", health)
-
-
-# ── Entry point ────────────────────────────────────────────────────────────────
-app.router.add_get("/", lambda r: web.Response(text="Socket.IO server is running"))
+app.router.add_get("/", lambda r: web.Response(text="Socket.IO relay server is running"))
 
 if __name__ == "__main__":
-    # Render.com injects PORT automatically — fallback to 8080 for local dev
     PORT = int(os.environ.get("PORT", 8080))
-    HOST = "0.0.0.0"
-    log.info(f"Starting Socket.IO server on {HOST}:{PORT}")
-    web.run_app(app, host=HOST, port=PORT)
+    log.info(f"Starting relay server on 0.0.0.0:{PORT}")
+    web.run_app(app, host="0.0.0.0", port=PORT)
