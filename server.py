@@ -12,6 +12,7 @@ Run:
 """
 
 import asyncio
+import os
 import logging
 from datetime import datetime
 import socketio
@@ -92,10 +93,11 @@ app.router.add_get("/health", health)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    HOST = "0.0.0.0"   # listen on all interfaces
-    PORT = 8080         # change if needed
+app.router.add_get("/", lambda r: web.Response(text="Socket.IO server is running"))
 
+if __name__ == "__main__":
+    # Render.com injects PORT automatically — fallback to 8080 for local dev
+    PORT = int(os.environ.get("PORT", 8080))
+    HOST = "0.0.0.0"
     log.info(f"Starting Socket.IO server on {HOST}:{PORT}")
-    log.info("Health check → http://<your-ip>:8080/health")
     web.run_app(app, host=HOST, port=PORT)
